@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Stick-Figure Pose Tracker</title>
+  <style>
+    :root { --bg: #0b0d10; --fg: #e7f5ff; --muted:#89a; }
+    html, body { height: 100%; margin: 0; background: var(--bg); color: var(--fg); font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial; }
+    .wrap { display: grid; grid-template-rows: auto 1fr auto; height: 100%; }
+    header, footer { padding: 10px 14px; display:flex; align-items:center; gap:12px; }
+    header h1 { font-size: 18px; margin: 0; letter-spacing: .3px; }
+    .pill { background:#151922; border:1px solid #202636; color: var(--fg); padding: 8px 12px; border-radius: 14px; display:flex; gap:8px; align-items:center; }
+    .pill input[type="range"]{ width:140px; }
+    .btn{ cursor:pointer; border:1px solid #2a3243; background:#141927; color:var(--fg); border-radius:12px; padding:8px 12px; }
+    .btn:disabled{ opacity:.5; cursor:not-allowed; }
+    .stack{ display:flex; gap:8px; flex-wrap:wrap; }
+    .stage { position: relative; width: 100%; height: 100%; overflow: hidden; }
+    #canvas { position:absolute; inset:0; width:100%; height:100%; display:block; }
+    #video { position:absolute; inset:0; width:100%; height:100%; object-fit: cover; transform: scaleX(-1); opacity: .12; filter: saturate(.2) contrast(1.1); }
+    .badge { font-size: 12px; color: var(--muted); }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>🕴️ Stick-Figure Pose Tracker</h1>
+    <div class="stack">
+      <label class="pill">Confidence <input id="conf" type="range" min="0" max="1" step="0.01" value="0.3"><span id="confv">0.30</span></label>
+      <label class="pill">Line width <input id="lw" type="range" min="1" max="16" step="1" value="6"><span id="lwv">6</span></label>
+      <button id="toggleMirror" class="btn" title="Mirror video & drawing (selfie mode)">Mirror: ON</button>
+      <button id="switchCam" class="btn" title="Switch camera">Switch Cam</button>
+      <button id="pauseBtn" class="btn" title="Pause/resume detection">⏸️ Pause</button>
+    </div>
+    <span id="status" class="badge">Loading TensorFlow + MoveNet…</span>
+  </header>
+
+  <div class="stage">
+    <video id="video" playsinline muted></video>
+    <canvas id="canvas"></canvas>
+  </div>
+
+  <footer>
+    <div class="badge">Tip: stand back so your full body fits in frame for best results. Works on desktop & mobile (HTTPS required for camera).</div>
+  </footer>
+</div>
+
+<!-- TFJS + Pose Detection (via CDN) -->
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core@4.20.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-converter@4.20.0/dist/tf-converter.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl@4.20.0/dist/tf-backend-webgl.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection@3.4.0/dist/pose-detection.min.js"></script>
+
+<script>
+(async () => {
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  const statusEl = document.getElementById('status');
+  const conf = document.getElementById('conf');
+  const confv = document.getElementById('confv');
+  const lw = document.getElementById('lw');
+  const lwv = document.getElementById('lwv');
+  const toggleMirror = document.getElementById('toggleMirror');
+  const switchCam = document.getElementById('switchCam');
+  const pauseBtn = document.getElementById('pauseBtn');
+
+  let detector, stream, running = true, mirror = true, currentDeviceId = null;
+
+  // MoveNet keypoint connections (COCO skeleton)
+  const EDGES = [
+    ['nose','left_eye'], ['nose','right_eye'],
+    ['left_eye','left_ear'], ['right_eye','right_ear'],
+    ['left_shoulder','right_shoulder'],
+    ['left_shoulder','left_elbow'], ['left_elbow','left_wrist'],
+    ['right_shoulder','right_elbow'], ['right_elbow','right_wrist'],
+    ['left_shoulder','left_hip'], ['right_shoulder','right_hip'],
+    ['left_hip','right_hip'],
+    ['left_hip','left_knee'], ['left_knee','left_ankle'],
+    ['right_hip','right_knee'], ['right_knee','right_ankle']
+  ];
+
+  const KP_INDEX = {
+    'nose':0,'left_eye':1,'right_eye':2,'left_ear':3,'right_ear':4,
+    'left_shoulder':5,'right_shoulder':6,'left_elbow':7,'right_elbow':8,
+    'left_wrist':9,'right_wrist':10,'left_hip':11,'right_hip':12,
+    'left_knee':13,'right_knee':14,'left_ankle':15,'right_ankle':16
+  };
+
+  function resizeCanvas() {
+    const dpr = Math.max(1, window.devicePixelRatio || 1);
+    const { clientWidth: w, clientHeight: h } = canvas;
+    canvas.width = Math.floor(w * dpr);
+    canvas.height = Math.floor(h * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  // Get list of cameras
+  async function getCameras() {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    return devices.filter(d => d.kind === 'videoinput');
+  }
+
+  async function startCamera(deviceId) {
+    if (stream) {
+      stream.getTracks().forEach(t => t.stop());
+    }
+    const constraints = {
+      audio: false,
+      video: {
+        deviceId: deviceId ? { exact: deviceId } : undefined,
+        facingMode: deviceId ? undefined : 'user',
+        width: { ideal: 1280 }, height: { ideal: 720 }
+      }
+    };
+    stream = await navigator.mediaDevices.getUserMedia(constraints);
+    video.srcObject = stream;
+    await video.play();
+
+    // Save the deviceId we actually got
+    const videoTrack = stream.getVideoTracks()[0];
+    currentDeviceId = videoTrack.getSettings().deviceId || deviceId || null;
+  }
+
+  async function setupTf() {
+    statusEl.textContent = 'Initializing TensorFlow…';
+    await tf.ready();
+    await tf.setBackend('webgl');
+
+    statusEl.textContent = 'Loading MoveNet (Thunder)…';
+    detector = await poseDetection.createDetector(
+      poseDetection.SupportedModels.MoveNet,
+      { modelType: poseDetection.movenet.modelType.SINGLEPOSE_THUNDER }
+    );
+
+    statusEl.textContent = 'Ready! Allow camera to begin.';
+  }
+
+  function drawStick(poses, threshold) {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    if (!poses || !poses.length) return;
+
+    const pose = poses[0];
+    const kp = pose.keypoints;
+
+    ctx.globalAlpha = 0.6;
+    for (const p of kp) {
+      if (p.score >= threshold) {
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
+        ctx.fillStyle = '#8fd';
+        ctx.fill();
+      }
+    }
+
+    ctx.lineWidth = parseInt(lw.value, 10);
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = '#5cf';
+    ctx.globalAlpha = 0.95;
+
+    for (const [a, b] of EDGES) {
+      const ka = kp[KP_INDEX[a]]; const kb = kp[KP_INDEX[b]];
+      if (ka && kb && ka.score >= threshold && kb.score >= threshold) {
+        ctx.beginPath();
+        ctx.moveTo(ka.x, ka.y);
+        ctx.lineTo(kb.x, kb.y);
+        ctx.stroke();
+      }
+    }
+
+    const nose = kp[0], le = kp[1], re = kp[2];
+    if (nose?.score >= threshold && le?.score >= threshold && re?.score >= threshold) {
+      const eyeDist = Math.hypot(le.x - re.x, le.y - re.y);
+      const r = Math.max(8, eyeDist * 0.9);
+      ctx.beginPath();
+      ctx.arc(nose.x, nose.y - r * 0.2, r, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+  }
+
+  async function detectLoop() {
+    if (!running) return;
+
+    ctx.save();
+    ctx.translate( (mirror? canvas.width : 0), 0 );
+    ctx.scale( mirror? -1 : 1, 1 );
+
+    try {
+      const poses = await detector.estimatePoses(video, { flipHorizontal: false });
+      drawStick(poses, parseFloat(conf.value));
+    } catch (err) {
+      console.error(err);
+      statusEl.textContent = 'Error: ' + err.message;
+    } finally {
+      ctx.restore();
+      requestAnimationFrame(detectLoop);
+    }
+  }
+
+  conf.addEventListener('input', () => confv.textContent = Number(conf.value).toFixed(2));
+  lw.addEventListener('input', () => lwv.textContent = lw.value);
+  toggleMirror.addEventListener('click', () => {
+    mirror = !mirror;
+    toggleMirror.textContent = `Mirror: ${mirror ? 'ON' : 'OFF'}`;
+    video.style.transform = mirror ? 'scaleX(-1)' : 'scaleX(1)';
+  });
+
+  pauseBtn.addEventListener('click', () => {
+    running = !running;
+    pauseBtn.textContent = running ? '⏸️ Pause' : '▶️ Resume';
+    if (running) requestAnimationFrame(detectLoop);
+  });
+
+  switchCam.addEventListener('click', async () => {
+    const cams = await getCameras();
+    if (!cams.length) return;
+    const idx = cams.findIndex(c => c.deviceId === currentDeviceId);
+    const next = cams[(idx + 1) % cams.length];
+    await startCamera(next.deviceId);
+    resizeCanvas();
+  });
+
+  // Kick off
+  try {
+    await setupTf();
+    await startCamera(null);
+    resizeCanvas(); // ensure canvas has dimensions once at start
+    await video.play(); // make sure the video is actually running
+    statusEl.textContent = 'Running. Move around!';
+    requestAnimationFrame(detectLoop);
+  } catch (e) {
+    console.error(e);
+    statusEl.textContent = 'Camera blocked or unavailable. Enable permissions & HTTPS.';
+  }
+
+  window.addEventListener('resize', resizeCanvas);
+})();
+</script>
+</body>
+</html>
